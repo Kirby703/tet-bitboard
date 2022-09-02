@@ -7,6 +7,9 @@ Started as a quick Python program. (found the 70-piece no-rotate loop that https
 That was also used to bash out some solutions for 23 zone lines in Tetris Effect.\
 But, it wasn't nearly enough for secret grade! The C version gets a 100-10000 times speedup.
 
+I didn't love the approach of https://github.com/professor-l/tetris-bitboard because it seemed like a lot of trouble for a result that's not quite perfect.\
+It did inspire me, and after a couple years of thinking on it, I'm glad my new design and implementation works well and can be taken farther.
+
 If you're reading from an era with 256-bit computing, you might represent a board or piece as 24 single-bit fenceposts and 23 10-bit rows, for 254 bits.\
 This would let you move pieces by bitshifting (>>1, >>11, <<1, <<11) with line clears as the only pain point.\
 But, doing this with a 64-bit computer sucks. Luckily, it's not 32, so I've allocated 16 bits per row, so a piece can fit into a 64-bit int.\
