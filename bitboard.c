@@ -2,25 +2,83 @@
 #include <stdint.h>
 #include <stdlib.h> //for exit()
 
-#define ROWS 25 //includes bottom solid row
-#define MAX_BOARDS 1000000
-//#define BLOOM_FILTER_SIZE 172909271 //should be prime. palindrome optional
-#define BLOOM_FILTER_SIZE 54218443
-//#define BLOOM_FILTER_SIZE 335333533
+//compile with -O2 !!!
+//it inlines the functions that are split up for readability.
+//-O3 breaks it (not place() or collides() as expected, but something with de-duplication)
+//haven't tested if -funroll-loops would also help (so, TODO)
+//also I didn't go ham optimizing the outermost loops because they're just not that important
 
-void GenQueue(uint32_t seed, int pieces[], int piececount);
+#define ROWS 28 //includes bottom solid row. need 24 (21 for board, 2 for full lines, 1 for bottom wall) but 32 (or 28 + parent) just makes cache hits happen *so much better* that it's worth the +33% memory and cpu time to copy boards around
 
-typedef struct {
+#define MAX_BOARDS 33000000 //not a beam search! you will have this many boards in total rather than per step.
+//downside compared to beam search: takes up 5-10 times as much memory, which is for naught if you only care about if a winning outcome exists
+//upside: saves all intermediate results so you don't have to run the program again or write to disk to get the sequence of moves corresponding to the good outcome
+
+#define BLOOM_FILTER_SIZE 335333533 //just has to be prime. 172909271 was nice but the larger, the better
+
+// ======================= START OF TGM2 RNG ======================= //
+typedef enum Block {
+    I, Z, S, J, L, O, T
+} Block;
+
+uint8_t LCG(uint32_t* seed) {
+    *seed = 0x41C64E6D * *seed + 12345;
+    return ((*seed >> 10) & 0x7FFF) % 7;
+}
+
+void GenQueue(uint32_t seed, int queue[], int queueLength) {
+    uint8_t history[4];
+    uint8_t next = Z;
+    while(next == Z || next == S || next == O) {
+        next = LCG(&seed);
+    }
+    history[0] = next;
+    history[1] = Z;
+    history[2] = S;
+    history[3] = S;
+    queue[0] = next;
+
+    for(int block = 1; block < queueLength; block++) {
+        for (int rolls = 0; rolls < 5; rolls++) {
+            next = LCG(&seed);
+            
+            char reroll = 0;
+            for (int i = 0; i < 4; i++) {
+                if (next == history[i]) {
+                    reroll = 1;
+                }
+            }
+
+            if (reroll) {
+                next = LCG(&seed); //you'd think this would be a nop but it's accurate to TGM2
+            } else {
+                break;
+            } 
+        }
+        history[3] = history[2];
+        history[2] = history[1];
+        history[1] = history[0];
+        history[0] = next;
+        queue[block] = next;
+    }
+}
+// ======================== END OF TGM2 RNG ======================== //
+
+//here be global variable dragons
+
+typedef struct board {
     uint16_t rows[ROWS];
+    struct board* parent;
 } board;
+_Static_assert(sizeof(board) == 64, "sizeof(board) != 64 which is a problem for cache hits");
 
 board boards[MAX_BOARDS];
 int boardCount = 1;
 
 int bloomFilter[BLOOM_FILTER_SIZE];
 
-void printboard(board* b) {
-    for(int i = ROWS-1; i > 0; i--) {
+void printBoard(board* b) {
+    for(int i = 23; i > 0; i--) {
         if(i <= 20) {
             printf("|");
         } else {
@@ -41,99 +99,97 @@ void printboard(board* b) {
     printf("\\--------------------/\n");
 }
 
-/*uint64_t pieces[] = {
-0x1e00000000000000, //I horiz
-0x1000100010001000, //I vert
-0x18000c0000000000, //Z horiz
-0x0800180010000000, //Z vert
-0x0c00180000000000, //S horiz
-0x1000180008000000, //S vert
-0x10001c0000000000, //J u
-0x1800100010000000, //J r
-0x1c00040000000000, //J d
-0x0800080018000000, //J l
-0x04001c0000000000, //L u
-0x1000100018000000, //L r
-0x1c00100000000000, //L d
-0x1800080008000000, //L l
-0x1800180000000000, //O
-0x08001c0000000000, //T u
-0x1000180010000000, //T r
-0x1c00080000000000, //T d
-0x0800180008000000  //T l
-}; //aligned to the top left of a 4x4 bounding box */
-
-int heights[] = {1, 4, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 2, 3, 2, 3};
-int widths[]  = {4, 1, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 2, 3, 2, 3, 2};
-
+//https://tetris.wiki/ARS
+//implemented as a 4x16 rectangle with 4 bits set where the piece is "centered" in the leftmost 4x4
 uint64_t pieces[] = {
-0x0000000000001e00, //I horiz
-0x1000100010001000, //I vert
-0x0000000018000c00, //Z horiz
-0x0000080018001000, //Z vert
-0x000000000c001800, //S horiz
-0x0000100018000800, //S vert
-0x0000000010001c00, //J u
-0x0000180010001000, //J r
-0x000000001c000400, //J d
-0x0000080008001800, //J l
-0x0000000004001c00, //L u
-0x0000100010001800, //L r
-0x000000001c001000, //L d
-0x0000180008000800, //L l
-0x0000000018001800, //O
-0x0000000008001c00, //T u
-0x0000100018001000, //T r
-0x000000001c000800, //T d
-0x0000080018000800  //T l
-}; //aligned to the bottom left of a 4x4 bounding box
+0x0000f00000000000, //I horiz ( - )
+0x2000200020002000, //I vert  ( | )
+0x0000c00060000000, //Z horiz (like the letter)
+0x2000600040000000, //Z vert
+0x00006000c0000000, //S horiz (like the letter)
+0x8000c00040000000, //S vert
+0x00008000e0000000, //J u
+0x6000400040000000, //J r
+0x0000e00020000000, //J d
+0x40004000c0000000, //J l (like the letter)
+0x00002000e0000000, //L u
+0x4000400060000000, //L r (like the letter)
+0x0000e00080000000, //L d
+0xc000400040000000, //L l
+0x0000600060000000, //O
+0x00004000e0000000, //T u
+0x4000600040000000, //T r
+0x0000e00040000000, //T d (like the letter)
+0x4000c00040000000  //T l
+};
+int map[] = {0, 2, 4, 6, 10, 14, 15, 19}; //index into 19 pieces[] by the 7 tetromino types
 
+//reading/writing 64 bits to a 16 bit aligned location is fine on most [citation definitely needed] 64-bit machines, or at least intels
 uint64_t collides(board* b, int piece, int row, int col) {
-    //printf("collides %d %d %d %ld %ld\n", piece, row, col, pieces[piece] >> col, *(uint64_t*)(b->rows + row));
     return *(uint64_t*)(b->rows + row) & (pieces[piece] >> col);
 }
 void place(board* b, int piece, int row, int col) {
-    //printf("place %d %d %d %ld %ld\n", piece, row, col, pieces[piece] >> col, *(uint64_t*)(b->rows + row));
     *(uint64_t*)(b->rows + row) |= (pieces[piece] >> col);
 }
 
-//TODO line clear function lmao
+//TODO a line clear function would be nice to extend this from tgm secret grade to a no rotate / pc finder
 
-int prune(board* b) {
-    //todo? parity check for the left triangle
-    //TODO rewrite with 64-bit masks and unrolled loops
-    if(b->rows[1] & 0x1000) { return 1; }
-    uint16_t tally = b->rows[1] | 0x1000; //bits get zeroed if there's been bad holes
-    if(~tally & b->rows[2]) { return 1; }
-    tally &= b->rows[2];
-    //TODO enable ITL opener by third row full, remove parity check
+int shouldPrune(board* b, board* nb) {
+    //this whole function is unavoidably specific to 2-line-clear secret grade!
+    //for guideline no-rotate, one might instead choose to prune any boards with a 1-wide hole
+
+    //TODO enable ITL opener by letting the third row be full instead of the second, and fix the green check accordingly
+    //see colors in https://fumen.zui.jp/?v115@JeB8IeJ8AeJ8AeJ8AeJ8AeJ8AeJ8AeJ8AeA8g0H8Ae?I8g0H8hlAeH8AeH8AeH8AeH8AeH8AeH8AeF8Q4A8AeG8Q4A?eR8AeI8JeAgH
+    if((b->rows[3] ^ nb->rows[3]) & (b->rows[4] ^ nb->rows[4]) & 0x1000) {
+        return 1; //both green: check for opening parity 1 mod 4
+    }
+    if((b->rows[12] ^ nb->rows[12]) & 0x0010 && ~(b->rows[14] ^ nb->rows[14]) & 0x0008) {
+        return 1; //bottom blue without top blue: check for turnaround parity 2 mod 4 (forces J)
+    }
+    if(((b->rows[11] ^ nb->rows[11]) & 0x0030) == 0x0020) {
+        return 1; //left orange without right orange: check for impossible turnaround overhang
+    }
+    
+    //TODO? this throws out boards with buried holes, but in doing so efficiently, it also throws out valid boards that require tucks or spins
+    //"tally" handles this, moving up the board and getting a bit zeroed if there's an empty cell in that column (aside from an intentional sg hole) and then if it encounters a filled cell with a zeroed bit, we know that the board has an overhang or hole and it gets discarded
+    if(nb->rows[1] & 0x1000) { return 1; }
+    uint16_t tally = nb->rows[1] | 0x1000;
+    
+    //full row
+    if(~tally & nb->rows[2]) { return 1; } //created an overhang/hole
+    tally &= nb->rows[2];
+    
     uint16_t mask = 0x1000;
     for(int row = 3; row <= 11; row++) {
         mask >>= 1;
-        if(b->rows[row] & mask) { return 1; }
-        if((b->rows[row+2] & (mask<<1)) && (~b->rows[row+1] & mask)) { return 1; } //quick overhang hack (bottom diagonal)
-        if(~tally & b->rows[row]) { return 1; }
-        tally &= b->rows[row] | mask;
+        if(nb->rows[row] & mask) { return 1; } //mistakenly filled an sg hole
+        if((nb->rows[row+2] & (mask<<1)) && (~nb->rows[row+1] & mask)) { return 1; } //impossible lack of overhang (bottom diagonal)
+        if(~tally & nb->rows[row]) { return 1; } //created an overhang/hole
+        tally &= nb->rows[row] | mask;
     }
     
-    if(~tally & b->rows[12]) { return 1; }
-    tally &= b->rows[12];
+    //full row
+    if(~tally & nb->rows[12]) { return 1; }
+    tally &= nb->rows[12];
     
     for(int row = 13; row <= 21; row++) {
         mask <<= 1;
-        if(b->rows[row] & mask) { return 1; }
-        if((b->rows[row+2] & (mask>>1)) && (~b->rows[row+1] & mask)) { return 1; } //quick overhang hack (top diagonal)
-        if(~tally & b->rows[row]) { return 1; }
-        tally &= b->rows[row] | mask;
+        if(nb->rows[row] & mask) { return 1; }
+        if((nb->rows[row+2] & (mask>>1)) && (~nb->rows[row+1] & mask)) { return 1; } //same check as above (top diagonal)
+        if(~tally & nb->rows[row]) { return 1; }
+        tally &= nb->rows[row] | mask;
     }
+    
     return 0;
 }
 
+//hash and bloom are a quick hack to eliminate most duplicate boards
+
 uint64_t hash(board* b) {
     //TODO: zobrist hashing?
-    //this fast (albeit maybe weak) one courtesy of a conversation with Electra
+    //this fast (albeit maybe weak) hash courtesy of a conversation with Electra
     uint64_t out = 0;
-    for(int row = 1; row < ROWS; row += 4) {
+    for(int row = 0; row < ROWS; row += 4) {
         out ^= *(uint64_t*)(b->rows + row);
     }
     return out;
@@ -146,6 +202,7 @@ int bloom(board* b) {
     if(out) {
         for(int i = 1; i < ROWS; i++) {
             if(boards[out].rows[i] != b->rows[i]) {
+                bloomFilter[h] = boardCount; //figure the old false-match is out of date / has fewer pieces
                 return 0;
             }
         }
@@ -161,175 +218,89 @@ void newboard(board* b, int piece, int row, int col) {
     for(int i = 0; i < ROWS; i++) {
         nb->rows[i] = b->rows[i];
     }
+    nb->parent = b;
     place(nb, piece, row, col);
-    //printf("pruning %d %d %d %d\n", piece, row, col, prune(b));
-    if((b->rows[3] ^ nb->rows[3]) & (b->rows[4] ^ nb->rows[4]) & 0x1000) {
-        //quick hack for opening parity
-        return;
-    }
-    if((b->rows[12] ^ nb->rows[12]) & 0x0010 && ~(b->rows[14] ^ nb->rows[14]) & 0x0008) {
-        //quick hack for turnaround parity (forces L)
-        return;
-    }
-    if(((b->rows[11] ^ nb->rows[11]) & 0x0030) == 0x0020) {
-        //quick hack for impossible turnaround overhang
-        return;
-    }
-    if(!prune(nb) && !bloom(nb)) {
-        /*if(boardCount < 20) {
-            printboard(nb);
-        }*/
-        if(nb->rows[21] == 0xEFFF && (nb->rows[22] & 0x1000) && (nb->rows[20] & 0x1000) && (3 <= col && col <= 5)) {
-            //TODO account for next piece spawning helping / actually move this code to sg_completes lmao
-            printf("sg complete %d\n", boardCount);
-            printboard(nb);
-        }
+    if(!shouldPrune(b, nb) && !bloom(nb)) {
         boardCount++;
         if(boardCount >= MAX_BOARDS) {
             printf("boardcount %d exiting\n", boardCount);
-            //exit(2);
+            exit(1);
         }
     }
 }
 
 void future(board* b, int piece) {
-    //TODO call sg_completes
-    for(int col = 0; col <= 10 - widths[piece]; col++) { //TODO start at middle col and move outward
-        int row = 21; //bottom left of piece, so this is 21-24, but with 2 full lines that's 19-22 in TAP, which is right. am aware this lets vertical I's get a row too high.
-        if(piece == 1) {
-            row = 20;
+    //check for completed secret grade
+    //only need to check the top rows; if anything at the bottom were wrong it would have been pruned
+    if(collides(b, piece, 20, 6)) {
+        place(b, piece, 20, 6);
+        if(b->rows[21] == 0xEFFF && (b->rows[20] & b->rows[22] & 0x1000)) {
+            printf("sg complete %d\n", boardCount);
+            printBoard(b);
+            while(b->parent) {
+                b = b->parent;
+                printBoard(b);
+            }
+            return;
         }
+    }
+    
+    //TODO? this double loop idea feels bad and really branchy! but maybe it doesn't actually take up a significant portion of the runtime?
+    for(int col = 6; !collides(b, piece, 20, col); col--) { //at 6, the very first for loop check will always succeed - hopefully the compiler optimizes it away
+        int row = 19; //20 was free so drop it by 1
+        while(!collides(b, piece, row, col)) {
+            row--;
+        }
+        row++; //can bump back up to 20
+        newboard(b, piece, row, col);
+    }
+    for(int col = 7; !collides(b, piece, 20, col); col++) {
+        int row = 19;
         while(!collides(b, piece, row, col)) {
             row--;
         }
         row++;
-        if(row <= 21) {
-            newboard(b, piece, row, col);
-            if(boardCount >= MAX_BOARDS) { break; }
-        }
-        if(boardCount >= MAX_BOARDS) { break; }
+        newboard(b, piece, row, col);
     }
 }
 
 void futures(int firstboard, int lastboard, int piece) {
     for(int i = firstboard; i < lastboard; i++) {
         future(&boards[i], piece);
-        if(boardCount >= MAX_BOARDS) { break; }
-    }
-}
-
-//TODO check for overlapping piece finishing sg
-void sg_completes(int firstboard, int lastboard, int piece) {
-    for(int i = firstboard; i < lastboard; i++) {
-        //future(&boards[i], piece);
-        //if(boardCount >= MAX_BOARDS) { break; }
-    }
-}
-
-void test_pieces() {
-    for(int i = 0; i < 19; i++) {
-        *(uint64_t*)(boards[i].rows+17) |= pieces[i]; //places at (17, 0)
-        printboard(&boards[i]);
-    }
-}
-
-void test_rng() { //looking for a 5-level topout e.g. IIIJI
-    for(int initSeed = 0; initSeed <= 2147483648; initSeed++) {
-        int p[5];
-        GenQueue(initSeed, p, 5);
-        int score = 0;
-        for(int i = 0; i < 5; i++) {
-            if(p[i]) {
-                score++;
-                if(score >= 2) {
-                    break;
-                }
-            }
-        }
-        if(score <= 1) {
-            printf("!!!! %d\n", initSeed);
-        }
-        if(initSeed % 50000000 == 0) {
-            printf("seed %d\n", initSeed);
-        }
     }
 }
 
 void init() {
-    //init just the first board with empty rows
-    for(int i = 0; i < 1; i++) {
-        boards[i].rows[0] = 0xFFFF;     //111 1111111111 111
-        for(int j = 1; j < ROWS; j++) {
-            boards[i].rows[j] = 0xE007; //111 0000000000 111
-        }
+    //init just the first board with empty rows as others will copy
+    boards[0].rows[0] = 0xFFFF;     //111 1111111111 111
+    for(int i = 1; i < ROWS; i++) {
+        boards[0].rows[i] = 0xE007; //111 0000000000 111
     }
+    boards[0].parent = 0;
     for(int i = 0; i < BLOOM_FILTER_SIZE; i++) {
         bloomFilter[i] = 0;
     }
 }
 
+void displayPieces() {
+    for(int i = 0; i < 19; i++) {
+        place(&boards[i], i, 18, 6); //18-21, correct for TAP (assuming no full lines)
+        printBoard(&boards[i]);
+    }
+}
+
 int main() {
-    //init();test_pieces();return 0;
-    //init();test_rng();return 0;
-    //for(int initSeed = 896; initSeed < 1195; initSeed++) { //most common seeds
-    //for(int initSeed = 600; initSeed < 1500; initSeed++) {
-    for(int initSeed = 1237; initSeed < 1238; initSeed++) { //first test seed
-    //for(int initSeed = 1071; initSeed < 1072; initSeed++) { //decent looking seed (blows up)
-    //for(int initSeed = 948; initSeed < 949; initSeed++) { //sg?! z end :(
-    //for(int initSeed = 1003; initSeed < 1004; initSeed++) { //other sg?! same :(
-    //for(int initSeed = 917; initSeed < 918; initSeed++) { //stress test
-    //int initSeed = 930; { //another promising seed
+    for(int initSeed = 896; initSeed < 1195; initSeed++) {
         init();
         boardCount = 1;
-        int firstboard = 0; //index
-        int lastboard = boardCount; // [firstboard, lastboard) for 1 piece bfs
+        int firstboard = 0; //index into boards
+        int lastboard = boardCount; // [firstboard, lastboard) for 1 step of bfs
         int p[53];
         GenQueue(initSeed, p, 53);
-        //int p[] = {0,6,3,4,1,5,0,3,6,4,5,0,1,6,2,3,4,0,1,5,3,4,6,0,2,5,4,1,3,3,6,0,4,2,1,6,0,5,2,1,6,4,0,2,1,3,4,0,6,1};
-        //int p[] = {0,6,4,2,5,1,2,6,4,5,0,1,6,2,5,4,1,0,6,5,3,1,2,6,5,3,0,4,2,6,1,5,4,3,1,6,2,5,0,3,6,2,4,1,5,3,2,0,6,5};
         for(int i = 0; i < 53; i++) {
-            switch(p[i]) {
-                case 0: //I
-                    for(int j = 0; j < 2; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 1: //Z
-                    for(int j = 2; j < 4; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 2: //S
-                    for(int j = 4; j < 6; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 3: //J
-                    for(int j = 6; j < 10; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 4: //L
-                    for(int j = 10; j < 14; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 5: //O
-                    for(int j = 14; j < 15; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                case 6: //T
-                    for(int j = 15; j < 19; j++) {
-                        futures(firstboard, lastboard, j);
-                    }
-                    break;
-                default:
-                    printf("oh no!!! %d\n", p[i]);
-                    return 1;
+            for(int j = map[p[i]]; j < map[p[i]+1]; j++) {
+                futures(firstboard, lastboard, j);
             }
-            if(boardCount >= MAX_BOARDS) { break; }
-            //futures(firstboard, lastboard, p[i]); //noro
             firstboard = lastboard;
             lastboard = boardCount;
             printf("seed %d boardcount %d\n", initSeed, boardCount);
