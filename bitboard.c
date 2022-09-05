@@ -10,6 +10,8 @@
 
 #define ROWS 28 //includes bottom solid row. need 24 (21 for board, 2 for full lines, 1 for bottom wall) but 32 (or 28 + parent) just makes cache hits happen *so much better* that it's worth the +33% memory and cpu time to copy boards around
 
+#define QUEUE_LENGTH 49 //for secret grade: 19*9 + 2 minos on the board, +20 for line clears, +3 for a finish = 196 minos = 49 tetrominoes minimum. 53 allows for many leftover minos in rows 20 and 21, if you just want a 2-line-clear secret GM rather than a perfect 50-level run.
+
 #define MAX_BOARDS 33000000 //not a beam search! you will have this many boards in total rather than per step.
 //downside compared to beam search: takes up 5-10 times as much memory, which is for naught if you only care about if a winning outcome exists
 //upside: saves all intermediate results so you don't have to run the program again or write to disk to get the sequence of moves corresponding to the good outcome
@@ -72,14 +74,14 @@ typedef struct board {
 } board;
 _Static_assert(sizeof(board) == 64, "sizeof(board) != 64 which is a problem for cache hits");
 
-board boards[MAX_BOARDS];
+board boards[MAX_BOARDS] __attribute__ ((aligned (64)));
 int boardCount = 1;
 
 int bloomFilter[BLOOM_FILTER_SIZE];
 
 void printBoard(board* b) {
     for(int i = 23; i > 0; i--) {
-        if(i <= 20) {
+        if(i <= 22) {
             printf("|");
         } else {
             printf(" ");
@@ -91,7 +93,7 @@ void printBoard(board* b) {
                 printf("..");
             }
         }
-        if(i <= 20) {
+        if(i <= 22) {
             printf("|");
         }
         printf("\n");
@@ -123,6 +125,7 @@ uint64_t pieces[] = {
 0x4000c00040000000  //T l
 };
 int map[] = {0, 2, 4, 6, 10, 14, 15, 19}; //index into 19 pieces[] by the 7 tetromino types
+int spawnOrientation[] = {0, 2, 4, 8, 12, 14, 17}; //same
 
 //reading/writing 64 bits to a 16 bit aligned location is fine on most [citation definitely needed] 64-bit machines, or at least intels
 uint64_t collides(board* b, int piece, int row, int col) {
@@ -189,7 +192,7 @@ uint64_t hash(board* b) {
     //TODO: zobrist hashing?
     //this fast (albeit maybe weak) hash courtesy of a conversation with Electra
     uint64_t out = 0;
-    for(int row = 0; row < ROWS; row += 4) {
+    for(int row = 0; row < 24; row += 4) {
         out ^= *(uint64_t*)(b->rows + row);
     }
     return out;
@@ -229,22 +232,26 @@ void newboard(board* b, int piece, int row, int col) {
     }
 }
 
-void future(board* b, int piece) {
+int sgComplete(board* b, int piece) {
     //check for completed secret grade
     //only need to check the top rows; if anything at the bottom were wrong it would have been pruned
     if(collides(b, piece, 20, 6)) {
         place(b, piece, 20, 6);
-        if(b->rows[21] == 0xEFFF && (b->rows[20] & b->rows[22] & 0x1000)) {
+        if(b->rows[20] == 0xF7FF && b->rows[21] == 0xEFFF && (b->rows[22] & 0x1000)) {
             printf("sg complete %d\n", boardCount);
             printBoard(b);
             while(b->parent) {
                 b = b->parent;
                 printBoard(b);
+                //TODO why print so many boards
             }
-            return;
         }
+        return 1;
     }
-    
+    return 0;
+}
+
+void future(board* b, int piece) {
     //TODO? this double loop idea feels bad and really branchy! but maybe it doesn't actually take up a significant portion of the runtime?
     for(int col = 6; !collides(b, piece, 20, col); col--) { //at 6, the very first for loop check will always succeed - hopefully the compiler optimizes it away
         int row = 19; //20 was free so drop it by 1
@@ -261,12 +268,6 @@ void future(board* b, int piece) {
         }
         row++;
         newboard(b, piece, row, col);
-    }
-}
-
-void futures(int firstboard, int lastboard, int piece) {
-    for(int i = firstboard; i < lastboard; i++) {
-        future(&boards[i], piece);
     }
 }
 
@@ -290,16 +291,20 @@ void displayPieces() {
 }
 
 int main() {
-    for(int initSeed = 896; initSeed < 1195; initSeed++) {
+    for(int initSeed = 0; initSeed <= 2100; initSeed++) {
         init();
         boardCount = 1;
         int firstboard = 0; //index into boards
         int lastboard = boardCount; // [firstboard, lastboard) for 1 step of bfs
-        int p[53];
-        GenQueue(initSeed, p, 53);
-        for(int i = 0; i < 53; i++) {
-            for(int j = map[p[i]]; j < map[p[i]+1]; j++) {
-                futures(firstboard, lastboard, j);
+        int p[QUEUE_LENGTH];
+        GenQueue(initSeed, p, QUEUE_LENGTH);
+        for(int i = 0; i < QUEUE_LENGTH; i++) {
+            for(int j = firstboard; j < lastboard; j++) {
+                if(!sgComplete(&boards[j], spawnOrientation[p[i]])) {
+                    for(int k = map[p[i]]; k < map[p[i]+1]; k++) {
+                        future(&boards[j], k);
+                    }
+                }
             }
             firstboard = lastboard;
             lastboard = boardCount;
